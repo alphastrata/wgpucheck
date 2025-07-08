@@ -5,7 +5,7 @@ edition = "2024"
 description = """
   wgpucheck is a CLI tool, that will show you information about your system's GPU, and its compute capabilities.
 """
-publish = false
+publish = true
 
 [dependencies]
 clap = { version = "4.5.40", features = ["derive"] }
