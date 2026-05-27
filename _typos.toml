@@ -1,0 +1,9 @@
+[default.extend-identifiers]
+colored = "colored"
+Serialize = "Serialize"
+skip_serializing_if = "skip_serializing_if"
+ColorfulTheme = "ColorfulTheme"
+
+[default.extend-words]
+center = "center"
+serialization = "serialization"
