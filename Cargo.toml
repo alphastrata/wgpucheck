@@ -8,10 +8,11 @@ description = """
 publish = true
 
 [dependencies]
-clap = { version = "4.5.40", features = ["derive"] }
-colored = "3.0.0"
-env_logger = "0.11.8"
+clap = { version = "4.6.1", features = ["derive"] }
+colored = "3.1.1"
+dialoguer = "0.12.0"
+env_logger = "0.11.10"
 pollster = "0.4.0"
-serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-wgpu = { version = "25.0.2", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+wgpu = { version = "29.0.3", features = ["serde"] }
