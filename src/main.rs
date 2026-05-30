@@ -12,9 +12,15 @@ use colored::Colorize;
 use dialoguer::{MultiSelect, theme::ColorfulTheme};
 use serde::Serialize;
 use std::{
-    cmp::Ordering,
+    cmp::Ordering as CmpOrdering,
     fmt,
-    sync::mpsc,
+    io::Write,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 use wgpu::Limits;
@@ -62,14 +68,6 @@ const INCEPTION_V3_SHAPES: &[MatmulShape] = &[
     MatmulShape::new(9, 1001, 2048),
 ];
 
-const TINY_SHAPES: &[MatmulShape] = &[
-    MatmulShape::new(1, 1, 1),
-    MatmulShape::new(4, 4, 4),
-    MatmulShape::new(4, 4, 16),
-    MatmulShape::new(1, 16, 16),
-    MatmulShape::new(16, 16, 16),
-];
-
 #[derive(Clone, Debug, ValueEnum)]
 enum OutputFormat {
     Table,
@@ -82,12 +80,11 @@ enum BenchProfile {
     Micro,
     Resnet50,
     Inceptionv3,
-    Tiny,
 }
 
 impl BenchProfile {
     const fn all() -> &'static [Self] {
-        &[Self::Micro, Self::Resnet50, Self::Inceptionv3, Self::Tiny]
+        &[Self::Micro, Self::Resnet50, Self::Inceptionv3]
     }
 
     const fn name(self) -> &'static str {
@@ -95,7 +92,6 @@ impl BenchProfile {
             Self::Micro => "micro",
             Self::Resnet50 => "resnet50",
             Self::Inceptionv3 => "inceptionv3",
-            Self::Tiny => "tiny",
         }
     }
 }
@@ -134,6 +130,10 @@ enum Command {
         /// Sort each table by GPU runtime ascending
         #[arg(long)]
         ascending: bool,
+
+        /// Verbose output (print per-bench tables)
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -212,6 +212,16 @@ impl BenchResult {
         self.gpu_time.map(|gpu_time| {
             ((self.cpu_roundtrip.as_secs_f64() / gpu_time.as_secs_f64()) - 1.0) * 100.0
         })
+    }
+
+    fn total_ops(&self) -> u64 {
+        self.payload_bytes / 4 * u64::from(self.runs) * 2
+    }
+
+    fn gpu_gops(&self) -> Option<f64> {
+        self.gpu_time
+            .filter(|gpu_time| !gpu_time.is_zero())
+            .map(|gpu_time| self.total_ops() as f64 / gpu_time.as_secs_f64() / 1_000_000_000.0)
     }
 }
 
@@ -670,6 +680,59 @@ fn verify_roundtrip(readback: &wgpu::Buffer, size: u64) -> Result<(), Box<dyn st
     }
 }
 
+fn run_spinner(label: &str) -> (Arc<AtomicBool>, thread::JoinHandle<()>) {
+    let done = Arc::new(AtomicBool::new(false));
+    let label = label.to_string();
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    let done_ref = Arc::clone(&done);
+    let handle = thread::spawn(move || {
+        let mut stderr = std::io::stderr().lock();
+        let mut frame = 0;
+        while !done_ref.load(Ordering::Relaxed) {
+            let _ = write!(stderr, "\r{} {} ...", frames[frame], label);
+            let _ = stderr.flush();
+            frame = (frame + 1) % frames.len();
+            thread::sleep(Duration::from_millis(80));
+        }
+        let _ = write!(stderr, "\r{}\r", " ".repeat(label.len() + 6));
+        let _ = stderr.flush();
+    });
+    (done, handle)
+}
+
+fn warmup_gpu(device: &wgpu::Device, queue: &wgpu::Queue) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("wgpucheck warmup shader"),
+        source: wgpu::ShaderSource::Wgsl("@compute @workgroup_size(1) fn main() {}".into()),
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("wgpucheck warmup layout"),
+        bind_group_layouts: &[],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("wgpucheck warmup pipeline"),
+        layout: Some(&layout),
+        module: &shader,
+        entry_point: Some("main"),
+        compilation_options: wgpu::PipelineCompilationOptions::default(),
+        cache: None,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("wgpucheck warmup encoder"),
+    });
+    {
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("wgpucheck warmup pass"),
+            timestamp_writes: None,
+        });
+        pass.set_pipeline(&pipeline);
+        pass.dispatch_workgroups(1, 1, 1);
+    }
+    queue.submit(Some(encoder.finish()));
+    let _ = device.poll(wgpu::PollType::wait_indefinitely());
+}
+
 fn run_copy_bench(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
@@ -677,17 +740,28 @@ fn run_copy_bench(
     runs: u32,
     label: &str,
 ) -> Result<BenchResult, Box<dyn std::error::Error>> {
-    let mut last_result = None;
+    let mut best: Option<BenchResult> = None;
 
     for _ in 0..BENCH_TIMESTAMP_ATTEMPTS {
+        let (spinner_done, spinner_handle) = run_spinner(label);
         let result = run_copy_bench_once(device, queue, payload_bytes, runs, label)?;
-        if result.gpu_time.is_some() {
-            return Ok(result);
+        spinner_done.store(true, Ordering::Relaxed);
+        let _ = spinner_handle.join();
+
+        if let Some(ref gpu_time) = result.gpu_time {
+            let faster = best
+                .as_ref()
+                .and_then(|b| b.gpu_time)
+                .is_none_or(|prev| gpu_time < &prev);
+            if faster {
+                best = Some(result);
+            }
+        } else if best.is_none() {
+            best = Some(result);
         }
-        last_result = Some(result);
     }
 
-    last_result.ok_or_else(|| "bench did not run".into())
+    best.ok_or_else(|| "bench did not run".into())
 }
 
 fn run_copy_bench_once(
@@ -1077,9 +1151,6 @@ fn run_profile_benchmarks(
         BenchProfile::Inceptionv3 => {
             push_shape_benches(&mut results, device, queue, INCEPTION_V3_SHAPES)?;
         }
-        BenchProfile::Tiny => {
-            push_shape_benches(&mut results, device, queue, TINY_SHAPES)?;
-        }
     }
 
     Ok(results)
@@ -1095,9 +1166,9 @@ fn sort_bench_results(results: &mut [BenchResult], sort: Option<BenchSort>) {
             BenchSort::Ascending => left.cmp(&right),
             BenchSort::Descending => right.cmp(&left),
         },
-        (Some(_), None) => Ordering::Less,
-        (None, Some(_)) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
+        (Some(_), None) => CmpOrdering::Less,
+        (None, Some(_)) => CmpOrdering::Greater,
+        (None, None) => CmpOrdering::Equal,
     });
 }
 
@@ -1136,27 +1207,107 @@ fn bench_profiles_or_default(
     }
 }
 
+fn format_bw(mib_per_s: f64) -> String {
+    const GIB: f64 = 1024.0;
+    const TIB: f64 = GIB * 1024.0;
+    if mib_per_s >= TIB {
+        format!("{:.2} TiB/s", mib_per_s / TIB)
+    } else if mib_per_s >= GIB {
+        format!("{:.2} GiB/s", mib_per_s / GIB)
+    } else {
+        format!("{:.1} MiB/s", mib_per_s)
+    }
+}
+
+fn format_compute(gops: f64) -> String {
+    if gops >= 1000.0 {
+        format!("{:.2} TOps/s", gops / 1000.0)
+    } else {
+        format!("{:.2} GOps/s", gops)
+    }
+}
+
+fn print_summary(adapter_info: &wgpu::AdapterInfo, all_results: &[BenchResult]) {
+    let large = all_results.iter().find(|r| r.label.contains("throughput x 10"));
+    let peak_bw = large
+        .and_then(|r| r.gpu_throughput_mib())
+        .or_else(|| {
+            all_results
+                .iter()
+                .filter_map(|r| r.gpu_throughput_mib())
+                .max_by(|a, b| a.total_cmp(b))
+        });
+    let peak_compute = large
+        .and_then(|r| r.gpu_gops())
+        .or_else(|| {
+            all_results
+                .iter()
+                .filter_map(|r| r.gpu_gops())
+                .max_by(|a, b| a.total_cmp(b))
+        });
+    let min_oneway = all_results
+        .iter()
+        .filter_map(|r| r.gpu_throughput_mib())
+        .min_by(|a, b| a.total_cmp(b));
+    let min_roundtrip = all_results
+        .iter()
+        .map(|r| r.cpu_throughput_mib())
+        .min_by(|a, b| a.total_cmp(b));
+
+    println!("{}", "WGPU GPU Benchmark Summary".bold().underline());
+    println!("{} {}", "Adapter:".cyan().bold(), adapter_info.name.yellow());
+    println!();
+    println!(
+        "{:<24} {}",
+        "Peak Bandwidth:".cyan().bold(),
+        peak_bw.map_or("n/a".red().to_string(), |v| format_bw(v).green().to_string())
+    );
+    println!(
+        "{:<24} {}",
+        "Min One-Way:".cyan().bold(),
+        min_oneway.map_or("n/a".red().to_string(), |v| format_bw(v).green().to_string())
+    );
+    println!(
+        "{:<24} {}",
+        "Min Round-Trip:".cyan().bold(),
+        min_roundtrip.map_or("n/a".red().to_string(), |v| format_bw(v).green().to_string())
+    );
+    println!(
+        "{:<24} {}",
+        "Peak Compute:".cyan().bold(),
+        peak_compute.map_or("n/a".red().to_string(), |v| format_compute(v).green().to_string())
+    );
+}
+
 fn run_benchmarks(
     profiles: Vec<BenchProfile>,
     sort: Option<BenchSort>,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (adapter_info, adapter_features, device, queue) =
         pollster::block_on(request_bench_device())?;
     let device_features = device.features();
+    warmup_gpu(&device, &queue);
+    let mut all_results = Vec::new();
 
     for profile in profiles {
         let mut results = run_profile_benchmarks(profile, &device, &queue)?;
         sort_bench_results(&mut results, sort);
-        print_bench_results(
-            profile,
-            &adapter_info,
-            adapter_features,
-            device_features,
-            &results,
-        );
-        println!();
+        if verbose {
+            println!();
+            print_bench_results(
+                profile,
+                &adapter_info,
+                adapter_features,
+                device_features,
+                &results,
+            );
+            println!();
+        }
+        all_results.extend(results);
     }
 
+    print_summary(&adapter_info, &all_results);
     Ok(())
 }
 
@@ -1171,6 +1322,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         list,
         descending,
         ascending,
+        verbose,
     }) = args.command
     {
         if list {
@@ -1188,7 +1340,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         };
 
-        return run_benchmarks(bench_profiles_or_default(profiles, interactive)?, sort);
+        return run_benchmarks(bench_profiles_or_default(profiles, interactive)?, sort, verbose);
     }
 
     let instance = wgpu::Instance::default();

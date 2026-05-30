@@ -1,6 +1,6 @@
 [package]
 name = "wgpucheck"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = """
   wgpucheck is a CLI tool, that will show you information about your system's GPU, and its compute capabilities.
