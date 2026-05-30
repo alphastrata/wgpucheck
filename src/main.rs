@@ -68,7 +68,6 @@ const INCEPTION_V3_SHAPES: &[MatmulShape] = &[
     MatmulShape::new(9, 1001, 2048),
 ];
 
-
 #[derive(Clone, Debug, ValueEnum)]
 enum OutputFormat {
     Table,
