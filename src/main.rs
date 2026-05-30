@@ -134,6 +134,10 @@ enum Command {
         /// Sort each table by GPU runtime ascending
         #[arg(long)]
         ascending: bool,
+
+        /// Verbose output (print per-bench tables)
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -212,6 +216,16 @@ impl BenchResult {
         self.gpu_time.map(|gpu_time| {
             ((self.cpu_roundtrip.as_secs_f64() / gpu_time.as_secs_f64()) - 1.0) * 100.0
         })
+    }
+
+    fn total_ops(&self) -> u64 {
+        self.payload_bytes / 4 * u64::from(self.runs) * 2
+    }
+
+    fn gpu_gops(&self) -> Option<f64> {
+        self.gpu_time
+            .filter(|gpu_time| !gpu_time.is_zero())
+            .map(|gpu_time| self.total_ops() as f64 / gpu_time.as_secs_f64() / 1_000_000_000.0)
     }
 }
 
@@ -1136,27 +1150,76 @@ fn bench_profiles_or_default(
     }
 }
 
+fn print_summary(adapter_info: &wgpu::AdapterInfo, all_results: &[BenchResult]) {
+    let peak_bw = all_results
+        .iter()
+        .filter_map(|r| r.gpu_throughput_mib())
+        .max_by(|a, b| a.total_cmp(b));
+    let min_oneway = all_results
+        .iter()
+        .filter_map(|r| r.gpu_throughput_mib())
+        .min_by(|a, b| a.total_cmp(b));
+    let min_roundtrip = all_results
+        .iter()
+        .map(|r| r.cpu_throughput_mib())
+        .min_by(|a, b| a.total_cmp(b));
+    let peak_compute = all_results
+        .iter()
+        .filter_map(|r| r.gpu_gops())
+        .max_by(|a, b| a.total_cmp(b));
+
+    println!("{}", "WGPU GPU Benchmark Summary".bold().underline());
+    println!("{} {}", "Adapter:".cyan().bold(), adapter_info.name.yellow());
+    println!();
+    println!(
+        "{:<24} {}",
+        "Peak Bandwidth:".cyan().bold(),
+        peak_bw.map_or("n/a".red().to_string(), |v| format!("{v:.1} MiB/s").green().to_string())
+    );
+    println!(
+        "{:<24} {}",
+        "Min One-Way:".cyan().bold(),
+        min_oneway.map_or("n/a".red().to_string(), |v| format!("{v:.1} MiB/s").green().to_string())
+    );
+    println!(
+        "{:<24} {}",
+        "Min Round-Trip:".cyan().bold(),
+        min_roundtrip.map_or("n/a".red().to_string(), |v| format!("{v:.1} MiB/s").green().to_string())
+    );
+    println!(
+        "{:<24} {}",
+        "Peak Compute:".cyan().bold(),
+        peak_compute.map_or("n/a".red().to_string(), |v| format!("{v:.2} GOps/s").green().to_string())
+    );
+}
+
 fn run_benchmarks(
     profiles: Vec<BenchProfile>,
     sort: Option<BenchSort>,
+    verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (adapter_info, adapter_features, device, queue) =
         pollster::block_on(request_bench_device())?;
     let device_features = device.features();
+    let mut all_results = Vec::new();
 
     for profile in profiles {
         let mut results = run_profile_benchmarks(profile, &device, &queue)?;
         sort_bench_results(&mut results, sort);
-        print_bench_results(
-            profile,
-            &adapter_info,
-            adapter_features,
-            device_features,
-            &results,
-        );
-        println!();
+        if verbose {
+            print_bench_results(
+                profile,
+                &adapter_info,
+                adapter_features,
+                device_features,
+                &results,
+            );
+            println!();
+        }
+        all_results.extend(results);
     }
 
+    print_summary(&adapter_info, &all_results);
     Ok(())
 }
 
@@ -1171,6 +1234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         list,
         descending,
         ascending,
+        verbose,
     }) = args.command
     {
         if list {
@@ -1188,7 +1252,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => None,
         };
 
-        return run_benchmarks(bench_profiles_or_default(profiles, interactive)?, sort);
+        return run_benchmarks(bench_profiles_or_default(profiles, interactive)?, sort, verbose);
     }
 
     let instance = wgpu::Instance::default();
